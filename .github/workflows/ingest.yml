@@ -1,0 +1,44 @@
+name: Ingest & Extract
+
+on:
+  # 1) По расписанию (UTC!)
+  schedule:
+    # каждые ~15 минут, но не на начале часа (чтобы избежать пиков нагрузки)
+    - cron: "7,22,37,52 * * * *"
+  # 2) Возможность запустить вручную из вкладки Actions
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    # Не даём параллельным копиям наслаиваться
+    concurrency:
+      group: ingest
+      cancel-in-progress: true  # новый запуск отменит предыдущий, если он ещё идёт
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        # (достаёт код в раннер; стандартный экшен) :contentReference[oaicite:3]{index=3}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"   # включает кэширование зависимостей pip
+        # В setup-python есть встроенная поддержка кэша для pip. :contentReference[oaicite:4]{index=4}
+
+      - name: Install deps
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run ingest script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python app/ingest_and_extract.py
