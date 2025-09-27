@@ -1,45 +1,37 @@
-name: Ingest & Extract
+name: Ingest (Telegram Bot Poll)
 
 on:
-  # 1) По расписанию (UTC!)
   schedule:
-    # каждые ~15 минут, но не на начале часа (чтобы избежать пиков нагрузки)
+    # каждые ~15 минут; можно чаще, минимум — каждые 5 мин
     - cron: "7,22,37,52 * * * *"
-  # 2) Возможность запустить вручную из вкладки Actions
   workflow_dispatch: {}
 
 jobs:
-  run:
+  poll:
     runs-on: ubuntu-latest
 
-    # Не даём параллельным копиям наслаиваться
     concurrency:
-      group: ingest
-      cancel-in-progress: true  # новый запуск отменит предыдущий, если он ещё идёт
+      group: ingest-bot-poll
+      cancel-in-progress: true
 
     steps:
-      - name: Check out repo
+      - name: Checkout
         uses: actions/checkout@v4
-        # (достаёт код в раннер; стандартный экшен) :contentReference[oaicite:3]{index=3}
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"   # включает кэширование зависимостей pip
-        # В setup-python есть встроенная поддержка кэша для pip. :contentReference[oaicite:4]{index=4}
+          cache: "pip"
 
       - name: Install deps
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Run ingest script
+      - name: Run bot poll
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
-          TG_CHANNELS: ${{ vars.TG_CHANNELS }}   # или secrets.TG_CHANNELS, если сохранишь как секрет
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}  # можно удалить, если не используешь
         run: |
-          python app/ingest_and_extract.py
-
+          python app/ingest_bot_poll.py
