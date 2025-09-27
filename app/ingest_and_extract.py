@@ -1,135 +1,152 @@
-import os
-import sys
+import os, sys, asyncio, json, math
 from datetime import datetime, timezone
 from dateutil import tz
 import psycopg
 from psycopg.rows import dict_row
 
-# ---------- helpers ----------
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
+from telethon.tl.types import Message
+
+# ---------- utils ----------
 def log(msg: str):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now_utc} UTC] {msg}", flush=True)
 
-def get_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        log(f"❌ ENV {name} is missing")
-        sys.exit(1)
-    return val
+def env(name: str, required=True, default=None):
+    v = os.getenv(name, default)
+    if required and (v is None or v == ""):
+        log(f"❌ ENV {name} is missing"); sys.exit(1)
+    return v
 
-# ---------- main ----------
-def main():
-    log("✅ Ingest job started")
-    db_url = get_env("DATABASE_URL")
+async def aiter_messages_safe(client: TelegramClient, peer, min_id: int):
+    """Итерация сообщений с защитой от FloodWait."""
+    try:
+        async for m in client.iter_messages(peer, min_id=min_id):
+            yield m
+    except FloodWaitError as e:
+        wait_s = int(e.seconds) + 1
+        log(f"⏳ FloodWaitError: sleep {wait_s}s"); await asyncio.sleep(wait_s)
 
-    # Подключение к БД (SSL обязателен для Supabase; обычно уже есть в URL ?sslmode=require)
-    # autocommit выключен: явный commit/rollback
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
-            # 1) Убедимся, что источник существует (простая upsert-логика)
-            src_kind = "telegram"
-            src_name = "Тестовый канал"
-            src_url  = "https://t.me/example1"
+def message_to_attachments(m: Message):
+    ent = [type(e).__name__ for e in (m.entities or [])]
+    return {
+        "has_media": bool(m.media),
+        "media_type": type(m.media).__name__ if m.media else None,
+        "entities": ent,
+        "reply_to_msg_id": getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None),
+        "fwd_from": bool(getattr(m, "fwd_from", None))
+    }
 
-            cur.execute("""
-                select id from public.sources
-                where kind = %s and coalesce(url,'') = %s and coalesce(name,'') = %s
-                limit 1
-            """, (src_kind, src_url, src_name))
-            row = cur.fetchone()
-            if row:
-                source_id = row["id"]
-                log(f"ℹ️  Source exists: id={source_id}")
-            else:
-                cur.execute("""
-                    insert into public.sources (kind, name, url)
-                    values (%s, %s, %s)
-                    returning id
-                """, (src_kind, src_name, src_url))
-                source_id = cur.fetchone()["id"]
-                log(f"➕ Source created: id={source_id}")
+# ---------- DB ops ----------
+def get_conn():
+    db_url = env("DATABASE_URL")
+    return psycopg.connect(db_url, row_factory=dict_row)
 
-            # 2) Вставим тестовый raw_item.
-            #    У raw_items стоит unique (source_id, external_id) — используем стабильный external_id,
-            #    чтобы повторные запуски не плодили дубликаты.
-            #    В реальном сборщике external_id = message_id из Telegram.
-            external_id = "test-message-0001"
-            published_at = datetime.now(timezone.utc)
-            author = "test_user"
-            url = "https://t.me/example1/123"
-            text_raw = (
-                "ВАКАНСИЯ: Инженер-геодезист. Вахта 30/15, оплата 200 000–250 000 ₽/мес. "
-                "Требования: опыт работы с тахеометром и GNSS (Trimble/Leica), AutoCAD/Civil 3D. "
-                "Контакты: @hr_example, +7 (999) 123-45-67, hr@example.com. Локация: Тюмень/ХМАО."
-            )
+def ensure_source(cur, kind: str, name: str, url: str) -> int:
+    cur.execute("""
+        select id from public.sources
+        where kind=%s and coalesce(url,'')=%s
+        limit 1
+    """, (kind, url))
+    r = cur.fetchone()
+    if r: return r["id"]
+    cur.execute("""
+        insert into public.sources (kind, name, url)
+        values (%s, %s, %s) returning id
+    """, (kind, name, url))
+    return cur.fetchone()["id"]
 
-            cur.execute("""
-                insert into public.raw_items
-                    (source_id, external_id, published_at, author, url, text_raw, attachments)
-                values
-                    (%s, %s, %s, %s, %s, %s, %s)
-                on conflict (source_id, external_id) do nothing
-                returning id
-            """, (source_id, external_id, published_at, author, url, text_raw, None))
+def max_msg_id(cur, source_id: int) -> int:
+    # external_id хранится как text, но для телеги это число — кастуем
+    cur.execute("""
+      select coalesce(max((case when external_id ~ '^[0-9]+$' then external_id::bigint else null end)), 0) as max_id
+      from public.raw_items where source_id=%s
+    """, (source_id,))
+    return int(cur.fetchone()["max_id"] or 0)
 
-            inserted = cur.fetchone()
-            if inserted:
-                raw_id = inserted["id"]
-                log(f"🧾 raw_items inserted: id={raw_id}")
-            else:
-                # запись уже есть — узнаем её id (полезно для последующих шагов)
-                cur.execute("""
-                    select id from public.raw_items
-                    where source_id=%s and external_id=%s
-                """, (source_id, external_id))
-                raw_id = cur.fetchone()["id"]
-                log(f"↺ raw_items already exists: id={raw_id}")
+def insert_raw(cur, source_id: int, msg: Message) -> int | None:
+    attachments = json.dumps(message_to_attachments(msg))
+    cur.execute("""
+      insert into public.raw_items
+        (source_id, external_id, published_at, author, url, text_raw, attachments)
+      values
+        (%s, %s, %s, %s, %s, %s, %s)
+      on conflict (source_id, external_id) do nothing
+      returning id
+    """, (
+        source_id,
+        str(msg.id),
+        msg.date.replace(tzinfo=timezone.utc),
+        str(getattr(msg, "sender_id", "")),
+        None,  # можно собрать t.me/<username>/<id> ниже, если нужно
+        msg.message or "",
+        attachments
+    ))
+    row = cur.fetchone()
+    return row["id"] if row else None
 
-            # 3) (Опционально) Пример вставки в jobs "черновика" вакансии.
-            #    В реальном пайплайне это делает экстрактор (LLM+правила).
-            role = "Инженер-геодезист"
-            description = text_raw
-            posted_at = published_at
+# ---------- Telegram ingest ----------
+async def ingest_telegram():
+    api_id = int(env("TG_API_ID"))
+    api_hash = env("TG_API_HASH")
+    string_session = env("TG_STRING_SESSION")
+    channels_raw = env("TG_CHANNELS", required=False, default="")
+    channels = [c.strip() for c in channels_raw.split(",") if c.strip()]
 
-            cur.execute("""
-                insert into public.jobs
-                    (source_id, raw_item_id, role, employer_name, is_employer,
-                     description, salary_min, salary_max, salary_currency, salary_period,
-                     employment_type, schedule_type, city, region, country,
-                     posted_at)
-                values
-                    (%s, %s, %s, %s, %s,
-                     %s, %s, %s, %s, %s,
-                     %s, %s, %s, %s, %s,
-                     %s)
-                returning id
-            """, (
-                source_id, raw_id, role, "ООО «ГеоТест»", True,
-                description, 200000, 250000, "RUB", "month",
-                "full", "вахта", "Тюмень", "Тюменская область", "RU",
-                posted_at
-            ))
-            job_id = cur.fetchone()["id"]
-            log(f"💾 jobs inserted: id={job_id} (fts-триггер заполнит индекс автоматически)")
+    if not channels:
+        log("⚠️  TG_CHANNELS is empty. Add comma-separated list of channels/links.")
+        return
 
-            # 4) Пример простого отчёта
-            cur.execute("select count(*) as c from public.raw_items")
-            total_raw = cur.fetchone()["c"]
-            cur.execute("select count(*) as c from public.jobs")
-            total_jobs = cur.fetchone()["c"]
-            log(f"📊 Totals — raw_items: {total_raw}, jobs: {total_jobs}")
+    log(f"🔌 Connecting to Telegram (channels: {len(channels)})")
+    async with TelegramClient(StringSession(string_session), api_id, api_hash) as client:
+        # DB connection inside to keep session short
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                total_new = 0
+                for ch in channels:
+                    try:
+                        entity = await client.get_entity(ch)
+                        # human-readable name/url
+                        ch_title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(ch)
+                        ch_url = f"https://t.me/{getattr(entity, 'username', '')}" if getattr(entity, "username", None) else str(ch)
 
-        # фиксируем все изменения
-        conn.commit()
+                        source_id = ensure_source(cur, "telegram", ch_title, ch_url)
+                        last_id = max_msg_id(cur, source_id)
+                        log(f"📥 {ch_title}: fetching messages > {last_id}")
 
-    # Для наглядности время в твоём поясе (Европа/Амстердам)
+                        new_cnt = 0
+                        async for m in aiter_messages_safe(client, entity, min_id=last_id):
+                            if not isinstance(m, Message):
+                                continue
+                            # фильтруем системные/пустые
+                            if not (m.message or m.media):
+                                continue
+                            inserted = insert_raw(cur, source_id, m)
+                            if inserted:
+                                new_cnt += 1
+                                if new_cnt % 50 == 0:
+                                    log(f"… {ch_title}: inserted {new_cnt}")
+                        conn.commit()
+                        total_new += new_cnt
+                        log(f"✅ {ch_title}: +{new_cnt} new")
+                    except Exception as e:
+                        log(f"💥 Error on {ch}: {e}")
+                        conn.rollback()
+                log(f"🎯 Telegram ingest done. New raw_items: {total_new}")
+
+    # timestamp in your local tz
     ams = datetime.now(timezone.utc).astimezone(tz.gettz("Europe/Amsterdam"))
     log(f"🕒 Finished. Local time (Amsterdam): {ams.strftime('%Y-%m-%d %H:%M:%S')}")
 
+def main():
+    asyncio.run(ingest_telegram())
+
 if __name__ == "__main__":
     try:
+        log("🚀 Ingest job started")
         main()
     except Exception as e:
-        log(f"💥 ERROR: {e}")
-        # чтобы ошибка подсветилась «красным» в Actions
+        log(f"💥 FATAL: {e}")
         raise

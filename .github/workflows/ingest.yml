@@ -39,6 +39,7 @@ jobs:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TG_CHANNELS: ${{ vars.TG_CHANNELS }}   # или secrets.TG_CHANNELS, если сохранишь как секрет
         run: |
           python app/ingest_and_extract.py
+
