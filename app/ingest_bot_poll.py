@@ -1,6 +1,8 @@
 import os, sys, json
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
+import socket
+import urllib.parse as urlparse
 
 import requests
 import psycopg
@@ -21,7 +23,18 @@ def env(name: str, required=True, default=None) -> str:
 # ---------------- DB helpers ----------------
 
 def db():
-    return psycopg.connect(env("DATABASE_URL"), row_factory=dict_row)
+    dsn = env("DATABASE_URL")
+    try:
+        parsed = urlparse.urlparse(dsn)
+        host = parsed.hostname
+        port = parsed.port or 5432
+        # берём IPv4-адрес (A-запись) и передаём его как hostaddr
+        ipv4 = socket.getaddrinfo(host, port, family=socket.AF_INET)[0][4][0]
+        return psycopg.connect(dsn, row_factory=dict_row, hostaddr=ipv4)
+    except Exception as e:
+        log(f"⚠️ IPv4 fallback failed ({e}), trying default connect()")
+        return psycopg.connect(dsn, row_factory=dict_row)
+
 
 def ensure_source(cur, chat: Dict[str, Any]) -> int:
     chat_id = str(chat["id"])
