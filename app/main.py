@@ -77,7 +77,15 @@ except Exception:  # pragma: no cover
         return None
 
 # ---------------- ENV ----------------
-load_dotenv()
+# --- add ---
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
+# грузим .env из корня репо, затем рядом со скриптом (если есть), не перезаписывая уже найденное
+load_dotenv(find_dotenv(filename=".env", usecwd=True), override=False)
+load_dotenv(Path(__file__).with_name(".env"), override=False)
+# --- end add ---
+
 rich_traceback_install(show_locals=False)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
