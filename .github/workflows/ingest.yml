@@ -1,36 +1,48 @@
-name: Ingest (Telegram Bot Poll)
+name: Ingest Telegram (bot poll)
 
 on:
   schedule:
-    - cron: "30 8 * * *"
-  workflow_dispatch: {}
+    - cron: '0 5 * * *'
+  workflow_dispatch:
 
 jobs:
-  poll:
+  ingest:
     runs-on: ubuntu-latest
 
-    concurrency:
-      group: ingest-bot-poll
-      cancel-in-progress: true
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          # для ручных запусков — берём именно текущую ветку
+          ref: ${{ github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
 
-      - name: Install deps
+      - name: Debug Python env
         run: |
-          pip install -r requirements.txt
+          which python
+          python --version
+          python -c "import sys,site;print(sys.executable);print(site.getsitepackages())"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt
+          # дымовой тест: сразу упадём, если чего-то не поставилось
+          python - << 'PY'
+import importlib.util as u
+mods = ["requests","telethon","psycopg","dotenv"]
+missing = [m for m in mods if u.find_spec(m) is None]
+assert not missing, f"Missing deps: {missing}"
+print("Imports OK")
+PY
 
       - name: Run bot poll
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}  # можно удалить, если не используешь
+          ALLOWED_CHAT_IDS: ${{ secrets.ALLOWED_CHAT_IDS }}
         run: |
-          python app/ingest_bot_poll.py
+          python -m app.ingest_bot_poll
