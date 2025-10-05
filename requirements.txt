@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 requests>=2.32.0
 telethon>=1.34.0
 psycopg[binary]>=3.2.1
@@ -5,3 +6,19 @@ python-dotenv>=1.0.1
 httpx>=0.27.0
 pydantic>=2.8.0
 supabase>=2.4.0
+=======
+# core
+supabase>=2.4.0
+python-dotenv>=1.0.1
+httpx>=0.27.0
+pydantic>=2.8.0
+rich>=13.7.1
+tenacity>=8.3.0
+rapidfuzz>=3.9.0
+
+# ingest
+psycopg[binary]>=3.2.1
+telethon>=1.34.0
+python-dateutil>=2.9.0
+requests>=2.32.0
+>>>>>>> 2ae96743cbf14722c6d68c4c31d7bcbbc8bf3714
