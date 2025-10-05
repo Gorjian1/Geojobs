@@ -2,8 +2,7 @@ name: Ingest (Telegram Bot Poll)
 
 on:
   schedule:
-    # каждые ~15 минут; можно чаще, минимум — каждые 5 мин
-    - cron: "7,22,37,52 * * * *"
+    - cron: "30 8 * * *"
   workflow_dispatch: {}
 
 jobs:
