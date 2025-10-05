@@ -1,0 +1,158 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GeoJobExtraction",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "is_candidate": {
+      "type": "boolean",
+      "description": "True if message is from a candidate seeking a job."
+    },
+    "is_employer": {
+      "type": "boolean",
+      "description": "True if message is from an employer or recruiter posting a job."
+    },
+    "position_title": {
+      "type": "string"
+    },
+    "city": {
+      "type": "string"
+    },
+    "country": {
+      "type": "string"
+    },
+    "work_format": {
+      "type": "string",
+      "enum": [
+        "вахта",
+        "фултайм",
+        "смена",
+        "частичная занятость",
+        "проект",
+        "не указано"
+      ]
+    },
+    "experience_years": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "salary_from": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "salary_to": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "salary_currency": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "RUB",
+        "KZT",
+        "USD",
+        "EUR",
+        "BYN",
+        "UAH",
+        "GEL",
+        "AMD",
+        "KGS",
+        "AZN",
+        "UZS",
+        "TJS",
+        "TRY",
+        "CNY",
+        "OTHER",
+        null
+      ]
+    },
+    "salary_period": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "месяц",
+        "час",
+        "смена",
+        "вахта",
+        "день",
+        "год",
+        null
+      ]
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "equipment": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "software": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "education": {
+      "type": "string"
+    },
+    "contacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "telegram": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "whatsapp": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "source_text": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  },
+  "required": [
+    "is_candidate",
+    "is_employer",
+    "source_text",
+    "confidence"
+  ]
+}
