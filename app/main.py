@@ -1,35 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-GeoJobs LLM Parser — Ollama Cloud → локальный Qwen (фейловер + thinking-валидатор*)
--------------------------------------------------------------------------------
-* Валидатор (второй LLM-проход) запускается ТОЛЬКО если модель доступна.
 
-ENV (.env в корне):
-  SUPABASE_URL=...
-  SUPABASE_SERVICE_ROLE_KEY=...
-  SUPABASE_RAW_TABLE=unparsed_raw_items
-  SUPABASE_PARSED_TABLE=jobs
-  RAW_TEXT_FIELD=text_raw
-
-  # первая попытка — облако
-  OLLAMA_CLOUD_MODEL=gpt-oss:20b-cloud
-  OLLAMA_CLOUD_HOST=https://ollama.com
-  OLLAMA_CLOUD_API_KEY=sk-...
-
-  # фолбэк — локально
-  OLLAMA_MODEL=qwen2.5:7b-instruct
-  OLLAMA_HOST=http://127.0.0.1:11434
-
-  # thinking-валидатор (опционально, включится только если модель есть)
-  ENABLE_VALIDATOR=1
-  VALIDATOR_MODEL=deepseek-r1:7b-q4_K_M     # или qwen2.5:14b-instruct-q4_K_M
-  VALIDATOR_HOST=http://127.0.0.1:11434
-
-  BATCH_SIZE=5
-  POLL_SECONDS=10
-  PRETTY=1
-"""
 from __future__ import annotations
 
 import argparse
@@ -39,11 +10,12 @@ import math
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from dotenv import load_dotenv, find_dotenv
+from pydantic import BaseModel, Field, model_validator
 from rapidfuzz import fuzz, process
 from supabase import Client, create_client  # type: ignore
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
@@ -71,41 +43,61 @@ except Exception:  # pragma: no cover
     HAS_RICH = False
     Console = None  # type: ignore
     Progress = None  # type: ignore
-    SpinnerColumn = BarColumn = TextColumn = TimeElapsedColumn = TimeRemainingColumn = object  # type: ignore
+
+    class _Stub:  # noqa: N801
+        def __call__(self, *a, **k):  # pragma: no cover
+            return None
+
+    SpinnerColumn = BarColumn = TextColumn = TimeElapsedColumn = TimeRemainingColumn = _Stub()  # type: ignore
 
     def rich_traceback_install(**kwargs):
         return None
 
-# ---------------- ENV ----------------
-# --- add ---
-from pathlib import Path
-from dotenv import load_dotenv, find_dotenv
-
-# грузим .env из корня репо, затем рядом со скриптом (если есть), не перезаписывая уже найденное
-load_dotenv(find_dotenv(filename=".env", usecwd=True), override=False)
+# ---------------- ENV загрузка ----------------
+# 1) корневой .env (относительно cwd); 2) .env рядом со скриптом (если вдруг есть), но НЕ перетираем уже считанное.
+load_dotenv(find_dotenv(filename=".env", usecwd=True), override=True)
 load_dotenv(Path(__file__).with_name(".env"), override=False)
-# --- end add ---
 
 rich_traceback_install(show_locals=False)
 
+# ---------------- Утилиты ----------------
+def pretty_print(msg: str) -> None:
+    if (os.getenv("PRETTY", "1") != "0") and HAS_RICH and Console:
+        Console().print(msg)  # type: ignore
+    else:
+        print(re.sub(r"\[/?[a-z]+\]", "", msg))
+
+
+def env_get(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """Вернуть первое непустое значение из ENV по списку имён (со strip())."""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+
+# ---------------- Конфиг ----------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
-RAW_TABLE = os.getenv("SUPABASE_RAW_TABLE", "unparsed_raw_items")
+SUPABASE_KEY = env_get("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY")
+RAW_TABLE = os.getenv("SUPABASE_RAW_TABLE", "v_jobs_input")
+
 PARSED_TABLE = os.getenv("SUPABASE_PARSED_TABLE", "jobs")
 RAW_TEXT_FIELD = os.getenv("RAW_TEXT_FIELD", "text_raw")
 
 # failover: сначала облако, затем локально
-CLOUD_MODEL = os.getenv("OLLAMA_CLOUD_MODEL")  # напр. gpt-oss:20b-cloud
-CLOUD_HOST = os.getenv("OLLAMA_CLOUD_HOST", "https://ollama.com").rstrip("/")
-CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY")
+CLOUD_MODEL = env_get("OLLAMA_CLOUD_MODEL", "CLOUD_MODEL")
+CLOUD_HOST = env_get("OLLAMA_CLOUD_HOST", "CLOUD_HOST", default="https://ollama.com").rstrip("/")
+CLOUD_API_KEY = env_get("OLLAMA_CLOUD_API_KEY", "CLOUD_API_KEY")
 
-LOCAL_MODEL = os.getenv("OLLAMA_MODEL")
-LOCAL_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+LOCAL_MODEL = env_get("OLLAMA_MODEL", "LLM_MODEL", "MODEL", default="qwen2.5:7b-instruct")
+LOCAL_HOST = env_get("OLLAMA_HOST", "LLM_HOST", default="http://127.0.0.1:11434").rstrip("/")
 
 # thinking-валидатор (опционально)
 ENABLE_VALIDATOR = os.getenv("ENABLE_VALIDATOR", "1") != "0"
-VALIDATOR_MODEL = os.getenv("VALIDATOR_MODEL", "")  # пусто = отключено
-VALIDATOR_HOST = os.getenv("VALIDATOR_HOST", LOCAL_HOST).rstrip("/")
+VALIDATOR_MODEL = os.getenv("VALIDATOR_MODEL", "")
+VALIDATOR_HOST = env_get("VALIDATOR_HOST", default=LOCAL_HOST).rstrip("/")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
@@ -113,17 +105,6 @@ USE_PRETTY = (os.getenv("PRETTY", "1") != "0") and HAS_RICH
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit("⛔ Нужны SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY в .env")
-
-console = Console() if USE_PRETTY else None
-
-
-def pretty_print(msg: str) -> None:
-    if USE_PRETTY and console is not None:
-        console.print(msg)
-    else:
-        # убираем rich-теги
-        print(re.sub(r"\[/?[a-z]+\]", "", msg))
-
 
 # ---------------- Supabase client ----------------
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -181,7 +162,7 @@ class ParsedItem(BaseModel):
     errors: List[str] = Field(default_factory=list)
 
 
-# ---------------- Санитайзинг телеграм-текста ----------------
+# ---------------- Санитайзинг & нормализация ----------------
 FORWARDED_RE = re.compile(r"^переслано от.*$", re.I | re.M)
 HASHTAG_RE = re.compile(r"(?:^|\s)#[\wА-Яа-я_]+")
 MULTISPACE_RE = re.compile(r"[ \t]{2,}")
@@ -190,7 +171,6 @@ URL_RE = re.compile(r"https?://\S+")
 PHONE_RE = re.compile(r"\+?\d[\d\s\-\.\(\)]{7,}")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TG_RE = re.compile(r"@([A-Za-z0-9_]{4,})")
-
 
 def sanitize_text(t: str) -> str:
     if not t:
@@ -202,8 +182,6 @@ def sanitize_text(t: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
 
-
-# ---------------- Нормализация ----------------
 CANON_EMPLOYMENT = {
     "полная занятость": "full_time",
     "full time": "full_time",
@@ -233,94 +211,31 @@ CANON_SCHEDULE = {
     "гибкий": "гибкий",
 }
 
-CANON_EQUIP = [
-    "GNSS",
-    "GPS",
-    "RTK",
-    "Тахеометр",
-    "Нивелир",
-    "Дрон",
-    "БПЛА",
-    "Лазерный сканер",
-    "ГИС",
-    "QGIS",
-    "Civil 3D",
-    "Total Station",
-]
+CANON_EQUIP = ["GNSS", "GPS", "RTK", "Тахеометр", "Нивелир", "Дрон", "БПЛА", "Лазерный сканер", "ГИС", "QGIS", "Civil 3D", "Total Station"]
+CANON_SKILLS = ["AutoCAD", "Civil 3D", "Revit", "QGIS", "ArcGIS", "Topo", "CAD", "Python", "SQL", "Metashape", "Photogrammetry"]
 
-CANON_SKILLS = [
-    "AutoCAD",
-    "Civil 3D",
-    "Revit",
-    "QGIS",
-    "ArcGIS",
-    "Topo",
-    "CAD",
-    "Python",
-    "SQL",
-    "Metashape",
-    "Photogrammetry",
-]
-
-CURRENCY_HINTS = {
-    "₽": "RUB",
-    "руб": "RUB",
-    "т.р": "RUB",
-    "тыс": "RUB",
-    "KZT": "KZT",
-    "₸": "KZT",
-    "тенге": "KZT",
-    "$": "USD",
-    "USD": "USD",
-    "дол": "USD",
-    "€": "EUR",
-    "EUR": "EUR",
-}
-
-SALARY_PERIOD_HINTS = {
-    "/ч": "hour",
-    "в час": "hour",
-    "час": "hour",
-    "/д": "day",
-    "в день": "day",
-    "смена": "shift",
-    "в месяц": "month",
-    "месяц": "month",
-    "мес": "month",
-    "м/ц": "month",
-    "вахта": "rotation",
-    "за проект": "project",
-}
-
+CURRENCY_HINTS = {"₽": "RUB", "руб": "RUB", "т.р": "RUB", "тыс": "RUB", "KZT": "KZT", "₸": "KZT", "тенге": "KZT", "$": "USD", "USD": "USD", "дол": "USD", "€": "EUR", "EUR": "EUR"}
+SALARY_PERIOD_HINTS = {"/ч": "hour", "в час": "hour", "час": "hour", "/д": "day", "в день": "day", "смена": "shift", "в месяц": "month", "месяц": "month", "мес": "month", "м/ц": "month", "вахта": "rotation", "за проект": "project"}
 
 def _canon_list(values: List[str], universe: List[str], limit: int = 8) -> List[str]:
-    """Безопасный канонизатор: выдерживает None из extractOne и удаляет дубли."""
     out: List[str] = []
     for v in (values or []):
         v = (v or "").strip()
         if not v:
             continue
-
-        res: Optional[Tuple[str, float, Any]] = process.extractOne(
-            v, universe, scorer=fuzz.WRatio
-        )
+        res: Optional[Tuple[str, float, Any]] = process.extractOne(v, universe, scorer=fuzz.WRatio)
         if res:
             best, score, *_ = res
             out.append(best if score >= 80 else v)
         else:
             out.append(v)
-
         if len(out) >= limit:
             break
-
-    seen = set()
-    uniq: List[str] = []
+    seen = set(); uniq: List[str] = []
     for x in out:
         if x not in seen:
-            seen.add(x)
-            uniq.append(x)
+            seen.add(x); uniq.append(x)
     return uniq
-
 
 def normalize(parsed: ParsedItem) -> ParsedItem:
     if parsed.employment:
@@ -329,47 +244,31 @@ def normalize(parsed: ParsedItem) -> ParsedItem:
             el = (e or "").lower()
             mapped.append(CANON_EMPLOYMENT.get(el, el))
         parsed.employment = list(dict.fromkeys(mapped))
-
     if parsed.schedule:
         mapped = []
         for s in parsed.schedule:
             sl = (s or "").lower()
             mapped.append(CANON_SCHEDULE.get(sl, sl))
         parsed.schedule = list(dict.fromkeys(mapped))
-
     parsed.equipment = _canon_list(parsed.equipment, CANON_EQUIP)
     parsed.skills = _canon_list(parsed.skills, CANON_SKILLS)
-
     if parsed.salary.currency not in {"RUB", "KZT", "USD", "EUR", "OTHER", "unknown"}:
         parsed.salary.currency = "OTHER"
-    if parsed.salary.period not in {
-        "month",
-        "day",
-        "hour",
-        "shift",
-        "rotation",
-        "project",
-        "unknown",
-    }:
+    if parsed.salary.period not in {"month","day","hour","shift","rotation","project","unknown"}:
         parsed.salary.period = "unknown"
-
     try:
         parsed.confidence = max(0.0, min(1.0, float(parsed.confidence or 0)))
     except Exception:
         parsed.confidence = 0.0
     return parsed
 
-
-# ---------------- Энрихер (правила поверх LLM) ----------------
+# ---------------- Энрихер ----------------
 RE_TAG_RESUME = re.compile(r"#\s?(резюме|камеральщик)\b", re.I)
 RE_TAG_VAC = re.compile(r"#\s?(вакансия|работа)\b", re.I)
 RE_NEED = re.compile(r"\b(требуется|ищем|в компанию|открыт набор)\b", re.I)
 RE_OFFER_SELF = re.compile(r"\b(предлагаю услуги|готов(а)? выполнить|ищу подработк|ищу удаленк)\b", re.I)
 
-RE_SALARY_TRUB = re.compile(
-    r"(?:з[п/\:]|зарплата|оплата)\s*[:=~-]?\s*(от\s*)?([0-9][0-9\s]{1,})(\+)?\s*(т\.?р|тыс\.?|руб\.?|₽)?",
-    re.I,
-)
+RE_SALARY_TRUB = re.compile(r"(?:з[п/\:]|зарплата|оплата)\s*[:=~-]?\s*(от\s*)?([0-9][0-9\s]{1,})(\+)?\s*(т\.?р|тыс\.?|руб\.?|₽)?", re.I)
 RE_SALARY_NUM = re.compile(r"\b([12][0-9]{2}\s?[0-9]{3}|[1-9][0-9]{4,})(?:\s*₽|\s*руб|\s*р\b)?", re.I)
 RE_PERIOD_MON = re.compile(r"\b(в\s*мес(яц)?|месяц|/мес)\b", re.I)
 RE_PERIOD_DAY = re.compile(r"\b(в\s*день|/д|сут(ки)?)\b", re.I)
@@ -377,41 +276,26 @@ RE_PERIOD_HR = re.compile(r"\b(в\s*час|/ч)\b", re.I)
 RE_PERIOD_SHFT = re.compile(r"\b(смена|за\s*смену)\b", re.I)
 RE_ROTATION = re.compile(r"\b(вахта|вахтовый)\b|\b(\d{1,2}\s*/\s*\d{1,2})\b", re.I)
 
-RE_LOC = re.compile(
-    r"\b(астраханск(ая|ой) область|камчатка|мурманск(ая|ой) обл\.?|белокаменка|новый\s+уренгой|москва|московск(ая|ой) область|шерегеш)\b",
-    re.I,
-)
-RE_CITY_ONLY = re.compile(
-    r"(уренгой|белокаменка|москва|шерегеш|би[йй]ск|коломна|пермь|троицк|с(е|ё)ргиев\s+посад|щербинка)",
-    re.I,
-)
+RE_LOC = re.compile(r"\b(астраханск(ая|ой) область|камчатка|мурманск(ая|ой) обл\.?|белокаменка|новый\s+уренгой|москва|московск(ая|ой) область|шерегеш)\b", re.I)
+RE_CITY_ONLY = re.compile(r"(уренгой|белокаменка|москва|шерегеш|би[йй]ск|коломна|пермь|троицк|с(е|ё)ргиев\s+посад|щербинка)", re.I)
 
 RE_EQUIP = re.compile(r"\b(гнсс|gnss|rtk|тахеометр|нивелир|бпла|дрон|сканер)\b", re.I)
 RE_SKILL = re.compile(r"\b(autocad|civil\s*3d|qgis|arcgis|metashape|камеральк(а|и))\b", re.I)
 
-
 def _period_from_text(t: str) -> str:
-    if RE_PERIOD_MON.search(t):
-        return "month"
-    if RE_PERIOD_DAY.search(t):
-        return "day"
-    if RE_PERIOD_HR.search(t):
-        return "hour"
-    if RE_PERIOD_SHFT.search(t):
-        return "shift"
-    if RE_ROTATION.search(t):
-        return "rotation"
+    if RE_PERIOD_MON.search(t): return "month"
+    if RE_PERIOD_DAY.search(t): return "day"
+    if RE_PERIOD_HR.search(t):  return "hour"
+    if RE_PERIOD_SHFT.search(t):return "shift"
+    if RE_ROTATION.search(t):   return "rotation"
     return "unknown"
-
 
 def _rub_hint(t: str) -> str:
     return "RUB" if re.search(r"(₽|руб|т\.?р|тыс\.?)", t, re.I) else "unknown"
 
-
 def _intify(num_str: str, unit_hint: str) -> Optional[int]:
     s = re.sub(r"\D", "", num_str or "")
-    if not s:
-        return None
+    if not s: return None
     val = int(s)
     if unit_hint and re.search(r"(т\.?р|тыс\.?)", unit_hint, re.I):
         val *= 1000
@@ -424,7 +308,6 @@ def _intify(num_str: str, unit_hint: str) -> Optional[int]:
         return None
     return val
 
-
 def rule_enrich(parsed: ParsedItem, text: str) -> ParsedItem:
     t = text
     if parsed.role == "unknown":
@@ -434,11 +317,7 @@ def rule_enrich(parsed: ParsedItem, text: str) -> ParsedItem:
             parsed.role = "candidate"
 
     if not parsed.position:
-        m = re.search(
-            r"\b(инженер\s*пто|техник-?геодезист|геодезист(\s*камеральщик|\s*полевик)?|оператор\s*бпла|камеральщик)\b",
-            t,
-            re.I,
-        )
+        m = re.search(r"\b(инженер\s*пто|техник-?геодезист|геодезист(\s*камеральщик|\s*полевик)?|оператор\s*бпла|камеральщик)\b", t, re.I)
         if m:
             parsed.position = m.group(0).strip().title()
 
@@ -448,9 +327,7 @@ def rule_enrich(parsed: ParsedItem, text: str) -> ParsedItem:
             span = m.span()
             phone_hit = any(not (ph.end() <= span[0] or ph.start() >= span[1]) for ph in PHONE_RE.finditer(t))
             if not phone_hit:
-                base = m.group(2) if (m.lastindex and m.lastindex >= 2 and m.group(2)) else (
-                    m.group(1) if m.lastindex and m.group(1) else m.group(0)
-                )
+                base = m.group(2) if (m.lastindex and m.lastindex >= 2 and m.group(2)) else (m.group(1) if m.lastindex and m.group(1) else m.group(0))
                 unit = m.group(4) if (m.lastindex and m.lastindex >= 4) else ""
                 val = _intify(base, unit or "")
                 if val is not None:
@@ -486,18 +363,12 @@ def rule_enrich(parsed: ParsedItem, text: str) -> ParsedItem:
         parsed.skills = [m.group(0).upper() for m in RE_SKILL.finditer(t)]
 
     if not (parsed.contact.phone or parsed.contact.telegram or parsed.contact.email):
-        ph = PHONE_RE.search(t)
-        tg = TG_RE.search(t)
-        em = EMAIL_RE.search(t)
-        if ph:
-            parsed.contact.phone = ph.group(0)
-        if tg:
-            parsed.contact.telegram = f"@{tg.group(1)}"
-        if em:
-            parsed.contact.email = em.group(0)
+        ph = PHONE_RE.search(t); tg = TG_RE.search(t); em = EMAIL_RE.search(t)
+        if ph: parsed.contact.phone = ph.group(0)
+        if tg: parsed.contact.telegram = f"@{tg.group(1)}"
+        if em: parsed.contact.email = em.group(0)
 
     return normalize(parsed)
-
 
 # ---------------- Подсказки и очистка ----------------
 def cheap_hints(text: str) -> Dict[str, str]:
@@ -506,10 +377,8 @@ def cheap_hints(text: str) -> Dict[str, str]:
     period = next((v for k, v in SALARY_PERIOD_HINTS.items() if k in t), "unknown")
     return {"currency": currency, "period": period}
 
-
 def clean_num(x, as_int=False):
-    if x is None:
-        return None
+    if x is None: return None
     try:
         y = float(x)
     except Exception:
@@ -517,19 +386,14 @@ def clean_num(x, as_int=False):
     if not math.isfinite(y):
         return None
     if as_int:
-        try:
-            return int(y)
-        except Exception:
-            return None
+        try: return int(y)
+        except Exception: return None
     return y
 
-
 def clean_str(s, maxlen=40000):
-    if s is None:
-        return None
+    if s is None: return None
     s = str(s)
     return s[:maxlen] if len(s) > maxlen else s
-
 
 # ---------------- DB I/O ----------------
 @retry(wait=wait_exponential_jitter(initial=1, max=8), stop=stop_after_attempt(5))
@@ -544,24 +408,21 @@ def fetch_batch(limit: int) -> List[Dict[str, Any]]:
     )
     return list(res.data or [])
 
-
 @retry(wait=wait_exponential_jitter(initial=1, max=6), stop=stop_after_attempt(5))
 def upsert_job(raw_row: Dict[str, Any], parsed: ParsedItem):
     def join_or_none(lst: Optional[List[str]]):
-        if not lst:
-            return None
+        if not lst: return None
         s = ", ".join(x for x in lst if x)
         return s or None
 
     role_val = parsed.position or parsed.role or None
     rl = (parsed.role or "").lower()
     is_employer = True if rl == "employer" else False if rl == "candidate" else None
-
     posted_at = raw_row.get("published_at") or raw_row.get("fetched_at")
 
     rec = {
         "source_id": raw_row.get("source_id"),
-        "raw_item_id": raw_row.get("id"),
+        "raw_item_id": raw_row.get("raw_id"),
         "role": clean_str(role_val, 255),
         "employer_name": clean_str(parsed.contact.name, 255),
         "is_employer": is_employer,
@@ -587,7 +448,6 @@ def upsert_job(raw_row: Dict[str, Any], parsed: ParsedItem):
     }
 
     import hashlib
-
     src = f"{rec.get('description') or ''}|{raw_row.get('author') or ''}|{rec.get('posted_at') or ''}"
     rec["dedup_hash"] = hashlib.sha1(src.encode("utf-8", "ignore")).hexdigest()
 
@@ -599,7 +459,6 @@ def upsert_job(raw_row: Dict[str, Any], parsed: ParsedItem):
             f"msg={getattr(e,'message',None)} hint={getattr(e,'hint',None)} details={getattr(e,'details',None)}"
         )
         raise
-
 
 # ---------------- LLM (Ollama Cloud → Local) ----------------
 SYSTEM_PROMPT = (
@@ -626,23 +485,9 @@ EXTRACTION_INSTRUCTION = (
 )
 
 LIMIT_HTTP_STATUSES = {401, 402, 403, 429}
-LIMIT_TEXT_PATTERNS = (
-    "limit",
-    "quota",
-    "credit",
-    "payment",
-    "billing",
-    "insufficient",
-    "not permitted",
-    "not allowed",
-    "subscription",
-    "rate limit",
-)
+LIMIT_TEXT_PATTERNS = ("limit","quota","credit","payment","billing","insufficient","not permitted","not allowed","subscription","rate limit")
 
-
-async def _ollama_chat(
-    host: str, model: str, text: str, api_key: Optional[str] = None, *, parse_json: bool = True
-) -> Dict[str, Any]:
+async def _ollama_chat(host: str, model: str, text: str, api_key: Optional[str] = None, *, parse_json: bool = True) -> Dict[str, Any]:
     payload = {
         "model": model,
         "format": "json",
@@ -655,7 +500,7 @@ async def _ollama_chat(
     }
     headers = {}
     if host.startswith("https://ollama.com") and api_key:
-        headers["Authorization"] = api_key
+        headers["Authorization"] = api_key  # если нужен Bearer, поменяй здесь
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(f"{host}/api/chat", json=payload, headers=headers)
         r.raise_for_status()
@@ -673,12 +518,9 @@ async def _ollama_chat(
                 raise
             return json.loads(m.group(0))
 
-
 FALLBACK_ACTIVATED = False
 
-
 async def cloud_preflight() -> bool:
-    """Один пробный вызов /api/chat без парсинга JSON — только статус."""
     if not CLOUD_MODEL:
         return False
     try:
@@ -692,7 +534,6 @@ async def cloud_preflight() -> bool:
         return False
     except Exception:
         return False
-
 
 async def call_llm_with_failover(text: str) -> Dict[str, Any]:
     global FALLBACK_ACTIVATED
@@ -719,8 +560,7 @@ async def call_llm_with_failover(text: str) -> Dict[str, Any]:
     pretty_print(f"[dim]→ Local {LOCAL_MODEL}[/dim]")
     return await _ollama_chat(LOCAL_HOST, LOCAL_MODEL, text)
 
-
-# --------- THINKING VALIDATOR (опционально, если модель доступна) ----------
+# --------- THINKING VALIDATOR (опционально) ----------
 VALIDATOR_SYSTEM = (
     "Ты — валидатор структурированных вакансий. "
     "Получишь исходный текст и JSON-объект. "
@@ -749,21 +589,17 @@ CITY_TO_REGION_COUNTRY = {
     "Шерегеш": ("Кемеровская область", "Россия"),
 }
 
-
 def rule_impute_geo(p: ParsedItem) -> ParsedItem:
     c = (p.city.city or "").strip()
     if c:
         hit = CITY_TO_REGION_COUNTRY.get(c) or CITY_TO_REGION_COUNTRY.get(c.title())
         if hit:
             region, country = hit
-            if not p.city.region:
-                p.city.region = region
-            if not p.city.country:
-                p.city.country = country
+            if not p.city.region: p.city.region = region
+            if not p.city.country: p.city.country = country
     if p.city.city and not p.city.country:
         p.city.country = "Россия"
     return p
-
 
 def rule_impute_schedule(p: ParsedItem, text: str) -> ParsedItem:
     if re.search(r"\b\d{1,2}\s*/\s*\d{1,2}\b", text):
@@ -772,7 +608,6 @@ def rule_impute_schedule(p: ParsedItem, text: str) -> ParsedItem:
         if "rotation" not in (p.employment or []):
             p.employment.append("rotation")
     return p
-
 
 def rule_fix_salary(p: ParsedItem, text: str) -> ParsedItem:
     if p.salary.currency == "unknown":
@@ -783,32 +618,12 @@ def rule_fix_salary(p: ParsedItem, text: str) -> ParsedItem:
         p.salary.min, p.salary.max = p.salary.max, p.salary.min
     return p
 
-
 async def _validator_available() -> bool:
-    """Проверяем, что валидатор можно вызвать (модель существует/доступна)."""
     if not ENABLE_VALIDATOR or not VALIDATOR_MODEL:
         return False
-
-    # локальная Ollama — проверим /api/tags
-    if VALIDATOR_HOST.startswith("http://127.0.0.1") or VALIDATOR_HOST.startswith("http://localhost"):
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(f"{VALIDATOR_HOST}/api/tags")
-                r.raise_for_status()
-                tags = r.json().get("models", []) or r.json().get("models", [])
-                names = {m.get("name") for m in tags if isinstance(m, dict)}
-                return VALIDATOR_MODEL in names
-        except Exception:
-            return False
-
-    # облачный хост — попробуем лёгкий префлайт chat без парсинга
+    # быстрый префлайт
     try:
-        payload = {
-            "model": VALIDATOR_MODEL,
-            "format": "json",
-            "stream": False,
-            "messages": [{"role": "user", "content": '{"probe":true}'}],
-        }
+        payload = {"model": VALIDATOR_MODEL, "format": "json", "stream": False, "messages": [{"role": "user", "content": '{"probe":true}'}]}
         headers = {}
         if VALIDATOR_HOST.startswith("https://ollama.com") and CLOUD_API_KEY:
             headers["Authorization"] = CLOUD_API_KEY
@@ -818,7 +633,6 @@ async def _validator_available() -> bool:
             return True
     except Exception:
         return False
-
 
 async def call_validator_llm_async(parsed: ParsedItem, text: str) -> ParsedItem:
     body = {
@@ -834,7 +648,6 @@ async def call_validator_llm_async(parsed: ParsedItem, text: str) -> ParsedItem:
     headers = {}
     if VALIDATOR_HOST.startswith("https://ollama.com") and CLOUD_API_KEY:
         headers["Authorization"] = CLOUD_API_KEY
-
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(f"{VALIDATOR_HOST}/api/chat", json=body, headers=headers)
         r.raise_for_status()
@@ -843,14 +656,10 @@ async def call_validator_llm_async(parsed: ParsedItem, text: str) -> ParsedItem:
         obj = json.loads(re.search(r"\{[\s\S]*\}", content).group(0)) if isinstance(content, str) else content
         return ParsedItem.model_validate(obj)
 
-
 async def validate_and_impute(parsed: ParsedItem, text: str) -> ParsedItem:
-    # 1) детерминированные правила
     p = rule_impute_geo(parsed)
     p = rule_impute_schedule(p, text)
     p = rule_fix_salary(p, text)
-
-    # 2) thinking-валидатор только если доступен
     if await _validator_available():
         try:
             p2 = await call_validator_llm_async(p, text)
@@ -861,22 +670,18 @@ async def validate_and_impute(parsed: ParsedItem, text: str) -> ParsedItem:
             return p
     return p
 
-
 # ---------------- Pipeline ----------------
 async def parse_one(row: Dict[str, Any]) -> None:
     raw_text = (row.get(RAW_TEXT_FIELD) or "").strip()
     text = sanitize_text(raw_text)
     if not text:
         return
-
     hints = cheap_hints(text)
     hinted_text = f"{text}\n\n[meta hints] currency≈{hints['currency']}, period≈{hints['period']}"
-
     try:
         llm_json = await call_llm_with_failover(hinted_text)
         parsed = ParsedItem.model_validate(llm_json)
     except Exception as e:
-        # fallback — пустая заготовка c минимальными данными
         try:
             m = re.search(r"\{[\s\S]*\}", str(e))
             llm_json = json.loads(m.group(0)) if m else {}
@@ -904,36 +709,24 @@ async def parse_one(row: Dict[str, Any]) -> None:
     parsed = rule_enrich(parsed, text)
     parsed = await validate_and_impute(parsed, text)
 
-    # контакты — последний шанс
     if not (parsed.contact.phone or parsed.contact.email or parsed.contact.telegram):
         phone = PHONE_RE.search(text)
         email = EMAIL_RE.search(text)
         tg = TG_RE.search(text)
-        if phone:
-            parsed.contact.phone = phone.group(0)
-        if email:
-            parsed.contact.email = email.group(0)
-        if tg:
-            parsed.contact.telegram = f"@{tg.group(1)}"
+        if phone: parsed.contact.phone = phone.group(0)
+        if email: parsed.contact.email = email.group(0)
+        if tg: parsed.contact.telegram = f"@{tg.group(1)}"
 
     upsert_job(row, parsed)
 
-
-# ---------------- Main loop + pretty progress ----------------
+# ---------------- Main loop ----------------
 async def main_loop(once: bool = False):
     cloud_note = CLOUD_MODEL and f"cloud: [magenta]{CLOUD_MODEL}[/] @ [cyan]{CLOUD_HOST}[/]" or "cloud: off"
     local_note = f"local: [magenta]{LOCAL_MODEL}[/] @ [cyan]{LOCAL_HOST}[/]"
-    val_note = (
-        f"validator: [magenta]{VALIDATOR_MODEL or 'off'}[/] @ [cyan]{VALIDATOR_HOST}[/]"
-        if ENABLE_VALIDATOR and VALIDATOR_MODEL
-        else "validator: off"
-    )
-    pretty_print(
-        f"[bold cyan]GeoJobs[/] • {cloud_note} • {local_note} • {val_note} • "
-        f"src: [green]{RAW_TABLE}[/] → [yellow]{PARSED_TABLE}[/]"
-    )
+    val_note = f"validator: [magenta]{VALIDATOR_MODEL or 'off'}[/] @ [cyan]{VALIDATOR_HOST}[/]" if ENABLE_VALIDATOR and VALIDATOR_MODEL else "validator: off"
+    pretty_print(f"[bold cyan]GeoJobs[/] • {cloud_note} • {local_note} • {val_note} • src: [green]{RAW_TABLE}[/] → [yellow]{PARSED_TABLE}[/]")
+    pretty_print(f"[dim]ENV check:[/] OLLAMA_MODEL={os.getenv('OLLAMA_MODEL')}  LLM_MODEL={os.getenv('LLM_MODEL')}  MODEL={os.getenv('MODEL')}")
 
-    # один префлайт облака на запуск
     global FALLBACK_ACTIVATED
     if CLOUD_MODEL and not FALLBACK_ACTIVATED:
         ok = await cloud_preflight()
@@ -946,17 +739,15 @@ async def main_loop(once: bool = False):
             batch = fetch_batch(BATCH_SIZE)
         except Exception as e:
             pretty_print(f"[red]Ошибка fetch_batch:[/] {e!r}")
-            if once:
-                break
-            await asyncio.sleep(POLL_SECONDS)
-            continue
+            if once: break
+            await asyncio.sleep(POLL_SECONDS); continue
 
         if not batch:
             if once:
                 pretty_print("[yellow]Нет новых записей — выходим[/]")
                 break
-            if USE_PRETTY and console is not None:
-                with console.status(f"Жду новые записи из [green]{RAW_TABLE}[/]…", spinner="dots"):
+            if (os.getenv("PRETTY", "1") != "0") and HAS_RICH and Console:
+                with Console().status(f"Жду новые записи из [green]{RAW_TABLE}[/]…", spinner="dots"):  # type: ignore
                     await asyncio.sleep(POLL_SECONDS)
             else:
                 time.sleep(POLL_SECONDS)
@@ -965,18 +756,18 @@ async def main_loop(once: bool = False):
         total = len(batch)
         pretty_print(f"[blue]Получен батч:[/] {total} записей")
 
-        if USE_PRETTY and console is not None:
+        if (os.getenv("PRETTY", "1") != "0") and HAS_RICH and Console:
             with Progress(
-                SpinnerColumn(style="cyan"),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("{task.completed}/{task.total}"),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console,
+                SpinnerColumn(style="cyan"),  # type: ignore
+                TextColumn("[progress.description]{task.description}"),  # type: ignore
+                BarColumn(),  # type: ignore
+                TextColumn("{task.completed}/{task.total}"),  # type: ignore
+                TimeElapsedColumn(),  # type: ignore
+                TimeRemainingColumn(),  # type: ignore
+                console=Console(),  # type: ignore
                 transient=True,
             ) as progress:
-                task = progress.add_task("Парсинг LLM…", total=total)
+                task = progress.add_task("Парсинг LLM…", total=total)  # type: ignore
                 coros = [parse_one(r) for r in batch]
                 for fut in asyncio.as_completed(coros):
                     try:
@@ -984,7 +775,7 @@ async def main_loop(once: bool = False):
                     except Exception as e:
                         pretty_print(f"[red]Ошибка при парсинге:[/] {e!r}")
                     finally:
-                        progress.advance(task)
+                        progress.advance(task)  # type: ignore
         else:
             coros = [parse_one(r) for r in batch]
             for fut in asyncio.as_completed(coros):
@@ -994,17 +785,26 @@ async def main_loop(once: bool = False):
                     print(f"Ошибка при парсинге: {e!r}")
 
         pretty_print("[green]Батч обработан[/]")
-
-        if once:
-            break
-
+        if once: break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # режим работы
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true", help="однократный проход по батчу")
     g.add_argument("--watch", action="store_true", help="бесконечный цикл с интервалом POLL_SECONDS")
+    # переопределения LLM из CLI
+    parser.add_argument("--local-model")
+    parser.add_argument("--cloud-model")
+    parser.add_argument("--local-host")
+    parser.add_argument("--cloud-host")
     args = parser.parse_args()
+
+    # применяем CLI-оверрайды
+    if args.local_model: LOCAL_MODEL = args.local_model
+    if args.cloud_model: CLOUD_MODEL = args.cloud_model
+    if args.local_host:  LOCAL_HOST  = args.local_host.rstrip("/")
+    if args.cloud_host:  CLOUD_HOST  = args.cloud_host.rstrip("/")
 
     try:
         asyncio.run(main_loop(once=args.once))
